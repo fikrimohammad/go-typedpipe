@@ -1,14 +1,17 @@
-package datastream
+package typedpipe
 
-// Option configures a new data stream.
+// Option configures a Pipe created by New.
 type Option func(*options)
 
-// options holds the configuration for a data stream.
+// options holds the internal configuration for a Pipe.
 type options struct {
 	bufferSize int
 }
 
-// WithBufferSize creates an Option to set the buffer size of the data stream.
+// WithBufferSize sets the capacity of the pipe's internal buffer.
+//
+// If size <= 0, the pipe is unbuffered.
+// If size exceeds MaxBufferSize, it is clamped to MaxBufferSize.
 func WithBufferSize(size int) Option {
 	return func(o *options) {
 		o.bufferSize = size
