@@ -8,248 +8,176 @@
 //   - Blocking reads and writes.
 //   - Idempotent close.
 //   - Propagation of the first close error to all subsequent operations.
+//   - Full drain of buffered values before returning a close error to readers.
+//
+// Shutdown semantics:
+//
+// Either side (Reader or Writer) may call Close/CloseWithError. When closed:
+//  1. All in-progress and future Write calls return the close error immediately.
+//  2. Read calls drain any buffered values, then return the close error.
+//
+// Note: Because both sides share a Closer, a reader may close the writer's
+// side and vice versa. This matches io.Pipe semantics and is intentional.
 package typedpipe
 
 import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 )
 
-var (
-	// ErrPipeClosed is returned when an operation is performed on a closed pipe.
-	// It is used when Close() is called without a custom error.
-	ErrPipeClosed = errors.New("pipe is closed")
-)
+// ErrPipeClosed is returned by operations on a closed pipe when no custom
+// error was provided to CloseWithError.
+var ErrPipeClosed = errors.New("pipe is closed")
 
 const (
 	// DefaultBufferSize is the default channel capacity.
 	DefaultBufferSize = 64
 
-	// MaxBufferSize caps the maximum allowed buffer size to prevent
-	// excessive memory allocation.
+	// MaxBufferSize is the maximum allowed buffer capacity.
+	// New returns an error if the requested size exceeds this value.
 	MaxBufferSize = 2048
 )
 
-// Writer represents the write side of the pipe.
-//
-// Write blocks until:
-//   - The value is delivered,
-//   - The context is canceled, or
-//   - The pipe is closed.
-//
-// Writer is safe for concurrent use.
+// Writer is the write side of the pipe.
 type Writer[T any] interface {
 	Write(ctx context.Context, v T) error
 	Closer
 }
 
-// Reader represents the read side of the pipe.
-//
-// Read blocks until:
-//   - A value is available,
-//   - The context is canceled, or
-//   - The pipe is closed and fully drained.
-//
-// Reader is safe for concurrent use.
+// Reader is the read side of the pipe.
 type Reader[T any] interface {
 	Read(ctx context.Context) (T, error)
 	Closer
 }
 
-// Closer defines shutdown semantics shared by Reader and Writer.
-//
-// CloseWithError preserves the first non-nil error. Subsequent calls are ignored.
+// Closer is the shared shutdown interface.
+// The first non-nil error passed to CloseWithError is retained;
+// subsequent calls are no-ops.
 type Closer interface {
-	// Close closes the pipe using ErrPipeClosed.
 	Close()
-
-	// CloseWithError closes the pipe with a custom error.
-	// The first non-nil error is retained and returned to all blocked
-	// and future operations.
 	CloseWithError(err error)
 }
 
 // New constructs a pipe and returns its Writer and Reader ends.
-//
-// Options may be used to configure buffering.
-// If bufferSize <= 0, the pipe behaves as unbuffered.
-func New[T any](opts ...Option) (Writer[T], Reader[T]) {
-	opt := &options{
-		bufferSize: DefaultBufferSize,
+func New[T any](opts ...Option) (Writer[T], Reader[T], error) {
+	opt := &options{bufferSize: DefaultBufferSize}
+	for _, o := range opts {
+		o(opt)
 	}
-
-	for _, optFn := range opts {
-		optFn(opt)
-	}
-
 	if opt.bufferSize > MaxBufferSize {
-		opt.bufferSize = MaxBufferSize
+		return nil, nil, errors.New("typedpipe: bufferSize exceeds MaxBufferSize")
 	}
-
-	var valueChan chan T
-	if opt.bufferSize < 1 {
-		valueChan = make(chan T)
-	} else {
-		valueChan = make(chan T, opt.bufferSize)
+	size := opt.bufferSize
+	if size < 0 {
+		size = 0
 	}
-
-	p := pipe[T]{
-		valueChan: valueChan,
-		done:      make(chan struct{}),
+	p := &pipe[T]{
+		ch:   make(chan T, size),
+		done: make(chan struct{}),
 	}
-
-	return &writer[T]{&p}, &reader[T]{&p}
+	return &writer[T]{p}, &reader[T]{p}, nil
 }
 
-// pipe contains shared state between Reader and Writer.
+// pipe holds all shared state.
 //
-// Shutdown ordering:
-//  1. close(done) signals termination.
-//  2. close(valueChan) unblocks readers.
+// Two channels carry distinct signals:
+//   - ch carries values from writers to readers.
+//   - done is closed once on shutdown, signalling all goroutines to stop.
 //
-// once guarantees idempotent shutdown.
+// ch is never closed, which means writers never risk a send-on-closed panic.
+// Readers drain ch via a non-blocking select each time done fires, returning
+// one buffered item per Read call until the buffer is empty.
+//
+// write() uses a non-blocking pre-check on done before the blocking select.
+// This gives shutdown priority over a buffered send: without it, Go's select
+// picks randomly between <-done and ch<-v when both are ready, allowing a
+// write to silently succeed after Close has been called.
 type pipe[T any] struct {
-	valueChan chan T
-	done      chan struct{}
-	once      sync.Once
-	err       pipeError
+	ch   chan T
+	done chan struct{}
+	once sync.Once
+	err  pipeError
 }
 
-// read receives a value from the pipe.
-//
-// It prioritizes:
-//   - Context cancellation,
-//   - Shutdown signal,
-//   - Incoming data.
-//
-// When closed, it attempts a final non-blocking drain of valueChan
-// before returning the stored close error.
-func (p *pipe[T]) read(ctx context.Context) (T, error) {
-	var zero T
-
-	select {
-	case <-ctx.Done():
-		return zero, ctx.Err()
-	case <-p.done:
-		// Pipe is closed. Drain remaining buffered value if present.
-		select {
-		case v, ok := <-p.valueChan:
-			if !ok {
-				return zero, p.closeError()
-			}
-			return v, nil
-		default:
-			return zero, p.closeError()
-		}
-	case v, ok := <-p.valueChan:
-		if !ok {
-			return zero, p.closeError()
-		}
-		return v, nil
-	}
-}
-
-// write sends a value to the pipe.
-//
-// It avoids panics from sending on a closed channel by selecting
-// on the done channel before attempting sending the value to channel.
 func (p *pipe[T]) write(ctx context.Context, v T) error {
+	// Non-blocking priority check: if the pipe or context is already done,
+	// return immediately before touching ch.
 	select {
+	case <-p.done:
+		return p.err.Load()
 	case <-ctx.Done():
 		return ctx.Err()
+	default:
+	}
+
+	select {
 	case <-p.done:
-		return p.closeError()
-	case p.valueChan <- v:
+		return p.err.Load()
+	case <-ctx.Done():
+		return ctx.Err()
+	case p.ch <- v:
 		return nil
 	}
 }
 
-// close performs idempotent shutdown.
-//
-// The first non-nil error is stored and becomes the terminal error
-// observed by all blocked and future operations.
+func (p *pipe[T]) read(ctx context.Context) (T, error) {
+	var zero T
+	select {
+	case <-ctx.Done():
+		return zero, ctx.Err()
+	case v := <-p.ch:
+		return v, nil
+	case <-p.done:
+		// Drain one buffered value if present; caller loops for the rest.
+		select {
+		case v := <-p.ch:
+			return v, nil
+		default:
+			return zero, p.err.Load()
+		}
+	}
+}
+
 func (p *pipe[T]) close(err error) {
 	p.once.Do(func() {
 		if err == nil {
 			err = ErrPipeClosed
 		}
-
 		p.err.Store(err)
-
 		close(p.done)
-		close(p.valueChan)
 	})
 }
 
-// closeError returns the stored shutdown error.
-func (p *pipe[T]) closeError() error {
-	return p.err.Load()
-}
-
-// pipeError stores the first close error safely.
-//
-// A mutex is used instead of sync/atomic.Value to avoid allocations
-// and preserve minimalism.
+// pipeError stores the first close error atomically.
+// Uses atomic.Value (Go 1.4+) rather than atomic.Pointer[T] (Go 1.19+)
+// for Go 1.18 compatibility.
 type pipeError struct {
-	err error
-	sync.Mutex
+	v atomic.Value // always holds *errorHolder
 }
 
-// Store records the first non-nil error.
+type errorHolder struct{ err error }
+
 func (pe *pipeError) Store(err error) {
-	pe.Lock()
-	defer pe.Unlock()
-
-	if pe.err != nil {
-		return
-	}
-	pe.err = err
+	pe.v.CompareAndSwap(nil, &errorHolder{err})
 }
 
-// Load retrieves the stored error.
 func (pe *pipeError) Load() error {
-	pe.Lock()
-	defer pe.Unlock()
-	return pe.err
+	if h, ok := pe.v.Load().(*errorHolder); ok {
+		return h.err
+	}
+	return nil
 }
 
-// writer implements Writer.
-type writer[T any] struct {
-	p *pipe[T]
-}
+type writer[T any] struct{ p *pipe[T] }
 
-// Write forwards to the underlying pipe.
-func (w *writer[T]) Write(ctx context.Context, v T) error {
-	return w.p.write(ctx, v)
-}
+func (w *writer[T]) Write(ctx context.Context, v T) error { return w.p.write(ctx, v) }
+func (w *writer[T]) Close()                               { w.p.close(nil) }
+func (w *writer[T]) CloseWithError(err error)             { w.p.close(err) }
 
-// Close closes with the default error.
-func (w *writer[T]) Close() {
-	w.CloseWithError(nil)
-}
+type reader[T any] struct{ p *pipe[T] }
 
-// CloseWithError closes with a custom error.
-func (w *writer[T]) CloseWithError(err error) {
-	w.p.close(err)
-}
-
-// reader implements Reader.
-type reader[T any] struct {
-	p *pipe[T]
-}
-
-// Read forwards to the underlying pipe.
-func (r *reader[T]) Read(ctx context.Context) (T, error) {
-	return r.p.read(ctx)
-}
-
-// Close closes with the default error.
-func (r *reader[T]) Close() {
-	r.CloseWithError(nil)
-}
-
-// CloseWithError closes with a custom error.
-func (r *reader[T]) CloseWithError(err error) {
-	r.p.close(err)
-}
+func (r *reader[T]) Read(ctx context.Context) (T, error) { return r.p.read(ctx) }
+func (r *reader[T]) Close()                              { r.p.close(nil) }
+func (r *reader[T]) CloseWithError(err error)            { r.p.close(err) }
