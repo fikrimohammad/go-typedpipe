@@ -1,15 +1,11 @@
 # go-typedpipe
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/fikrimohammad/go-typedpipe.svg)](https://pkg.go.dev/github.com/fikrimohammad/go-typedpipe)
+[![CI](https://github.com/fikrimohammad/go-typedpipe/actions/workflows/ci.yml/badge.svg)](https://github.com/fikrimohammad/go-typedpipe/actions/workflows/ci.yml)
 
-`go-typedpipe` provides a generic, in-memory, concurrency-safe pipe.
+`go-typedpipe` provides a generic, in-memory, concurrency-safe pipe for streaming typed values between goroutines.
 
-It connects a `Writer[T]` and a `Reader[T]` for streaming typed values between goroutines with:
-
-* Blocking semantics
-* Backpressure
-* Context cancellation
-* Idempotent close with error propagation
+It is conceptually similar to `io.Pipe`, but operates on values of any type `T` instead of `[]byte`. Unlike a plain `chan T`, it provides context-aware blocking, idempotent close with error propagation, and a drain guarantee — buffered values written before close remain readable after close.
 
 It is a small synchronization primitive, not a queue or broker.
 
@@ -25,29 +21,66 @@ Requires Go 1.18 or later.
 
 ---
 
-## Overview
-
-`go-typedpipe` is conceptually similar to `io.Pipe`, but operates on values of type `T` instead of `[]byte`.
-
-A pipe consists of:
-
-* A `Writer[T]`
-* A `Reader[T]`
-
-Either side may close the pipe. The first non-nil close error is retained and returned by subsequent operations.
-
----
-
 ## Example
 
 ```go
-w, r := typedpipe.New[int]()
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	typedpipe "github.com/fikrimohammad/go-typedpipe"
+)
+
+func main() {
+	w, r, err := typedpipe.New[int]()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	go func() {
+		for i := 0; i < 3; i++ {
+			if err := w.Write(ctx, i); err != nil {
+				log.Println("write:", err)
+				return
+			}
+		}
+		w.Close()
+	}()
+
+	for {
+		v, err := r.Read(ctx)
+		if err != nil {
+			break
+		}
+		fmt.Println(v)
+	}
+	// Output:
+	// 0
+	// 1
+	// 2
+}
+```
+
+### Propagating errors with CloseWithError
+
+```go
+w, r, err := typedpipe.New[int]()
+if err != nil {
+	log.Fatal(err)
+}
 
 ctx := context.Background()
 
 go func() {
-	for i := 0; i < 3; i++ {
-		_ = w.Write(ctx, i)
+	if err := fetchData(ctx, w); err != nil {
+		// Signal the reader why the pipe stopped.
+		w.CloseWithError(fmt.Errorf("fetch failed: %w", err))
+		return
 	}
 	w.Close()
 }()
@@ -55,9 +88,10 @@ go func() {
 for {
 	v, err := r.Read(ctx)
 	if err != nil {
+		log.Println("reader stopped:", err) // fetch failed: ...
 		break
 	}
-	fmt.Println(v)
+	process(v)
 }
 ```
 
@@ -73,9 +107,7 @@ for {
 * `ctx` is canceled
 * The pipe is closed
 
-If the pipe is closed, `Write` returns the stored close error.
-
----
+Returns the stored close error if the pipe is closed, or `ctx.Err()` if the context is canceled.
 
 ### Read
 
@@ -85,33 +117,45 @@ If the pipe is closed, `Write` returns the stored close error.
 * `ctx` is canceled
 * The pipe is closed and fully drained
 
-After buffered values are consumed, `Read` returns the stored close error.
-
----
+After all buffered values are consumed, returns the stored close error.
 
 ### Close
 
 * `Close()` closes the pipe with `ErrPipeClosed`.
-* `CloseWithError(err)` closes the pipe with `err`.
-* Close is idempotent.
-* The first non-nil error wins.
+* `CloseWithError(err)` closes the pipe with a custom error. If `err` is nil, `ErrPipeClosed` is used.
+* Both are idempotent — subsequent calls are no-ops.
+* The first non-nil error wins and is returned to all future operations.
 
 ---
 
 ## Buffering
 
-Default buffer size: `64`
-Maximum buffer size: `2048`
-
-Configure:
+| | Value |
+|---|---|
+| Default buffer size | `64` |
+| Maximum buffer size | `2048` |
 
 ```go
-w, r := typedpipe.New[int](
+w, r, err := typedpipe.New[int](
 	typedpipe.WithBufferSize(128),
 )
+if err != nil {
+	log.Fatal(err)
+}
 ```
 
-If the buffer size is ≤ 0, the pipe is unbuffered.
+A buffer size of 0 or less produces an unbuffered pipe, where each `Write` blocks until a corresponding `Read` occurs.
+
+---
+
+## Guarantees
+
+* **Safe for concurrent use** — multiple goroutines may call `Read`, `Write`, and `Close` simultaneously.
+* **No send-on-closed-channel panics** — the internal channel is never closed; shutdown is signalled separately.
+* **Idempotent shutdown** — calling `Close` or `CloseWithError` multiple times is safe.
+* **First error wins** — the close error is set once and never overwritten.
+* **Full drain on close** — values written before close are fully readable after close, in order.
+* **Backpressure** — `Write` blocks when the buffer is full, preventing unbounded memory growth.
 
 ---
 
@@ -122,22 +166,13 @@ Appropriate for:
 * Producer–consumer pipelines
 * Worker coordination
 * Structured streaming between goroutines
-* Replacing `chan T` when explicit close error and context-aware operations are required
+* Replacing `chan T` when context-aware operations and close error propagation are needed
 
 Not intended for:
 
-* Broadcast or fan-out
+* Broadcast or fan-out (single reader only)
 * Durable messaging
 * Cross-process communication
-
----
-
-## Guarantees
-
-* Safe for concurrent use
-* No send-on-closed-channel panics
-* Idempotent shutdown
-* Backpressure by default
 
 ---
 
