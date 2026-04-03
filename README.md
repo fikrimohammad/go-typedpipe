@@ -8,7 +8,18 @@
 It is conceptually similar to `io.Pipe`, but operates on values of any type `T` instead of `[]byte`. Unlike a plain `chan T`, it provides context-aware blocking, idempotent close with error propagation, and a drain guarantee — buffered values written before close remain readable after close.
 
 It is a small synchronization primitive, not a queue or broker.
-
+ 
+## Why not just use a channel?
+ 
+A plain `chan T` works well for simple cases, but leaves several concerns to the caller:
+ 
+| | `chan T` | `go-typedpipe` |
+|---|---|---|
+| Context-aware blocking | Manual `select` on every send/receive | Built into `Write` and `Read` |
+| Close error propagation | Not supported | `CloseWithError` propagates to all consumers |
+| Safe concurrent close | Panics on double-close | Idempotent, safe to call multiple times |
+| Drain guarantee | Values may be lost after close | All buffered values remain readable after close |
+| Consumer loop | Boilerplate `for range` or `select` | `ReadAll` encapsulates the loop |
 ---
 
 ## Installation
