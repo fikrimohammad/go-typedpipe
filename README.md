@@ -1,6 +1,6 @@
 # go-typedpipe
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/fikrimohammad/go-typedpipe.svg)](https://pkg.go.dev/github.com/fikrimohammad/go-typedpipe)
+[![Go Reference](https://pkg.go.dev/badge/github.com/fikrimohammad/go-typedpipe.svg)](https://pkg.go.dev/github.com/fikrimohammad/go-typedpipe/v2)
 [![CI](https://github.com/fikrimohammad/go-typedpipe/actions/workflows/ci.yml/badge.svg)](https://github.com/fikrimohammad/go-typedpipe/actions/workflows/ci.yml)
 
 `go-typedpipe` provides a generic, in-memory, concurrency-safe pipe for streaming typed values between goroutines.
@@ -25,7 +25,7 @@ A plain `chan T` works well for simple cases, but leaves several concerns to the
 ## Installation
 
 ```bash
-go get github.com/fikrimohammad/go-typedpipe
+go get github.com/fikrimohammad/go-typedpipe/v2
 ```
 
 Requires Go 1.18 or later.
