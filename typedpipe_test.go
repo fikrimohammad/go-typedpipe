@@ -13,11 +13,7 @@ import (
 
 func newPipe[T any](t *testing.T, opts ...Option) (Writer[T], Reader[T]) {
 	t.Helper()
-	w, r, err := New[T](opts...)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	return w, r
+	return New[T](opts...)
 }
 
 func bg() context.Context { return context.Background() }
@@ -25,18 +21,22 @@ func bg() context.Context { return context.Background() }
 // ── construction ──────────────────────────────────────────────────────────────
 
 func TestNew(t *testing.T) {
-	t.Run("rejects oversized buffer", func(t *testing.T) {
-		_, _, err := New[int](WithBufferSize(MaxBufferSize + 1))
-		if err == nil {
-			t.Fatal("expected error for bufferSize > MaxBufferSize")
-		}
+	t.Run("default buffer size", func(t *testing.T) {
+		w, r := New[int]()
+		defer w.Close()
+		_ = r
 	})
 
-	t.Run("accepts MaxBufferSize exactly", func(t *testing.T) {
-		_, _, err := New[int](WithBufferSize(MaxBufferSize))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+	t.Run("large buffer size is allowed", func(t *testing.T) {
+		w, r := New[int](WithBufferSize(1 << 20)) // 1M — no cap enforced
+		defer w.Close()
+		_ = r
+	})
+
+	t.Run("unbuffered pipe via zero size", func(t *testing.T) {
+		w, r := New[int](WithBufferSize(0))
+		defer w.Close()
+		_ = r
 	})
 }
 
@@ -363,4 +363,71 @@ func TestRace_ContextCancelAndClose(t *testing.T) {
 		go func() { w.Close() }()
 		r.Read(ctx) //nolint:errcheck
 	}
+}
+
+// ── ReadAll ───────────────────────────────────────────────────────────────────
+
+func TestReadAll(t *testing.T) {
+	t.Run("collects all values and returns nil on normal close", func(t *testing.T) {
+		const n = 64
+		w, r := newPipe[int](t, WithBufferSize(n))
+		for i := 0; i < n; i++ {
+			w.Write(bg(), i)
+		}
+		w.Close()
+
+		var got []int
+		err := r.ReadAll(bg(), func(v int) error {
+			got = append(got, v)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("got err %v, want nil", err)
+		}
+		if len(got) != n {
+			t.Fatalf("got %d items, want %d", len(got), n)
+		}
+		for i, v := range got {
+			if v != i {
+				t.Fatalf("got[%d] = %d, want %d", i, v, i)
+			}
+		}
+	})
+
+	t.Run("returns context error when context canceled", func(t *testing.T) {
+		_, r := newPipe[int](t, WithBufferSize(0))
+		ctx, cancel := context.WithCancel(bg())
+		cancel()
+		err := r.ReadAll(ctx, func(int) error { return nil })
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("returns custom close error", func(t *testing.T) {
+		sentinel := errors.New("sentinel")
+		w, r := newPipe[int](t)
+		w.CloseWithError(sentinel)
+		err := r.ReadAll(bg(), func(int) error { return nil })
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("got %v, want sentinel", err)
+		}
+	})
+
+	t.Run("stops and returns fn error", func(t *testing.T) {
+		w, r := newPipe[int](t)
+		go func() {
+			for i := 0; ; i++ {
+				if err := w.Write(bg(), i); err != nil {
+					return
+				}
+			}
+		}()
+
+		fnErr := errors.New("fn error")
+		err := r.ReadAll(bg(), func(int) error { return fnErr })
+		if !errors.Is(err, fnErr) {
+			t.Fatalf("got %v, want fnErr", err)
+		}
+	})
 }
