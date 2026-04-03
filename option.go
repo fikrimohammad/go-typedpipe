@@ -9,7 +9,7 @@ type options struct {
 
 // WithBufferSize sets the pipe's internal channel capacity.
 // A value <= 0 produces an unbuffered (synchronous) pipe.
-// Values > MaxBufferSize cause New() to return an error.
+// Buffer sizing and any upper-bound enforcement is left to the caller.
 func WithBufferSize(n int) Option {
 	return func(o *options) {
 		o.bufferSize = n

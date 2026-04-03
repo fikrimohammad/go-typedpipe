@@ -34,10 +34,6 @@ var ErrPipeClosed = errors.New("pipe is closed")
 const (
 	// DefaultBufferSize is the default channel capacity.
 	DefaultBufferSize = 64
-
-	// MaxBufferSize is the maximum allowed buffer capacity.
-	// New returns an error if the requested size exceeds this value.
-	MaxBufferSize = 2048
 )
 
 // Writer is the write side of the pipe.
@@ -49,6 +45,12 @@ type Writer[T any] interface {
 // Reader is the read side of the pipe.
 type Reader[T any] interface {
 	Read(ctx context.Context) (T, error)
+	// ReadAll calls fn for each value until the pipe is closed or ctx is done.
+	// The pipe is closed automatically when ReadAll returns.
+	// Returns nil on normal close (ErrPipeClosed), or a non-nil error if the
+	// pipe was closed with a custom error, the context was canceled, or fn
+	// returns a non-nil error.
+	ReadAll(ctx context.Context, fn func(T) error) error
 	Closer
 }
 
@@ -61,13 +63,10 @@ type Closer interface {
 }
 
 // New constructs a pipe and returns its Writer and Reader ends.
-func New[T any](opts ...Option) (Writer[T], Reader[T], error) {
+func New[T any](opts ...Option) (Writer[T], Reader[T]) {
 	opt := &options{bufferSize: DefaultBufferSize}
 	for _, o := range opts {
 		o(opt)
-	}
-	if opt.bufferSize > MaxBufferSize {
-		return nil, nil, errors.New("typedpipe: bufferSize exceeds MaxBufferSize")
 	}
 	size := opt.bufferSize
 	if size < 0 {
@@ -77,7 +76,7 @@ func New[T any](opts ...Option) (Writer[T], Reader[T], error) {
 		ch:   make(chan T, size),
 		done: make(chan struct{}),
 	}
-	return &writer[T]{p}, &reader[T]{p}, nil
+	return &writer[T]{p}, &reader[T]{p}
 }
 
 // pipe holds all shared state.
@@ -179,5 +178,21 @@ func (w *writer[T]) CloseWithError(err error)             { w.p.close(err) }
 type reader[T any] struct{ p *pipe[T] }
 
 func (r *reader[T]) Read(ctx context.Context) (T, error) { return r.p.read(ctx) }
+func (r *reader[T]) ReadAll(ctx context.Context, fn func(T) error) error {
+	defer r.Close()
+	for {
+		v, err := r.Read(ctx)
+		if err != nil {
+			if errors.Is(err, ErrPipeClosed) {
+				return nil
+			}
+			return err
+		}
+		if err := fn(v); err != nil {
+			r.CloseWithError(err)
+			return err
+		}
+	}
+}
 func (r *reader[T]) Close()                              { r.p.close(nil) }
 func (r *reader[T]) CloseWithError(err error)            { r.p.close(err) }
