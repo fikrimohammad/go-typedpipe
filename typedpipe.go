@@ -194,5 +194,5 @@ func (r *reader[T]) ReadAll(ctx context.Context, fn func(T) error) error {
 		}
 	}
 }
-func (r *reader[T]) Close()                              { r.p.close(nil) }
-func (r *reader[T]) CloseWithError(err error)            { r.p.close(err) }
+func (r *reader[T]) Close()                   { r.p.close(nil) }
+func (r *reader[T]) CloseWithError(err error) { r.p.close(err) }

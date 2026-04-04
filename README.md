@@ -210,6 +210,47 @@ Buffer sizing and any upper-bound enforcement is left to the caller. A value of 
 
 ---
 
+## Benchmark
+
+Benchmarked on Apple M4 Pro, Go 1.22. Run with:
+
+```bash
+go test -bench=. -benchmem -benchtime=3s ./...
+```
+
+```
+goos: darwin
+goarch: arm64
+cpu: Apple M4 Pro
+ 
+BenchmarkPipe_WriteRead/unbuffered-14           14642935      245.3 ns/op     0 B/op   0 allocs/op
+BenchmarkPipe_WriteRead/buffer_64-14            27531162      128.9 ns/op     0 B/op   0 allocs/op
+BenchmarkPipe_WriteRead/buffer_256-14           30460545      118.2 ns/op     0 B/op   0 allocs/op
+BenchmarkPipe_WriteRead/buffer_1024-14          33059798      109.3 ns/op     0 B/op   0 allocs/op
+ 
+BenchmarkPipe_ReadAll/unbuffered-14             14487556      243.2 ns/op     0 B/op   0 allocs/op
+BenchmarkPipe_ReadAll/buffer_64-14              27784093      130.7 ns/op     0 B/op   0 allocs/op
+BenchmarkPipe_ReadAll/buffer_256-14             30330379      116.8 ns/op     0 B/op   0 allocs/op
+BenchmarkPipe_ReadAll/buffer_1024-14            33114181      108.6 ns/op     0 B/op   0 allocs/op
+ 
+BenchmarkPipe_ConcurrentWriters/goroutines_2-14     21403360      169.5 ns/op     0 B/op   0 allocs/op
+BenchmarkPipe_ConcurrentWriters/goroutines_8-14     15097734      226.0 ns/op     0 B/op   0 allocs/op
+BenchmarkPipe_ConcurrentWriters/goroutines_32-14    10917823      311.0 ns/op     0 B/op   0 allocs/op
+ 
+BenchmarkPipe_ConcurrentReaders/goroutines_2-14      9401684      374.0 ns/op     0 B/op   0 allocs/op
+BenchmarkPipe_ConcurrentReaders/goroutines_8-14      5456012      656.2 ns/op     0 B/op   0 allocs/op
+BenchmarkPipe_ConcurrentReaders/goroutines_32-14     4851226      751.3 ns/op     0 B/op   0 allocs/op
+```
+
+**Key observations:**
+
+- **Zero allocations** across all benchmarks — no GC pressure regardless of throughput.
+- **`ReadAll` overhead is negligible** — virtually identical to raw `Read` at every buffer size.
+- **Larger buffers improve throughput** — `buffer_1024` at ~109 ns/op vs unbuffered at ~245 ns/op, as writers block less frequently.
+- **Concurrent readers degrade gracefully** — throughput scales predictably under contention without panics or data races.
+
+---
+
 ## Use Cases
 
 Appropriate for:
