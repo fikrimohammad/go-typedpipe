@@ -37,6 +37,19 @@ const (
 )
 
 // Writer is the write side of the pipe.
+//
+// The writer must always close the pipe when done, regardless of how it exits.
+// Failing to call Close or CloseWithError will leave readers blocked forever.
+// The recommended pattern is to defer the close at the start of the goroutine:
+//
+//	go func() {
+//	    defer w.Close()
+//	    for _, v := range data {
+//	        if err := w.Write(ctx, v); err != nil {
+//	            return
+//	        }
+//	    }
+//	}()
 type Writer[T any] interface {
 	Write(ctx context.Context, v T) error
 	Closer
@@ -50,6 +63,10 @@ type Reader[T any] interface {
 	// Returns nil on normal close (ErrPipeClosed), or a non-nil error if the
 	// pipe was closed with a custom error, the context was canceled, or fn
 	// returns a non-nil error.
+	//
+	// Note: if multiple goroutines call ReadAll concurrently, the first one to
+	// return will close the pipe, causing all others to stop early. For
+	// concurrent consumers, use Read instead.
 	ReadAll(ctx context.Context, fn func(T) error) error
 	Closer
 }
