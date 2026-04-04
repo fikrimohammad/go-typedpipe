@@ -40,38 +40,38 @@ The scraper goroutine writes each scraped `Result` into the pipe as soon as it's
 
 ```go
 type Result struct {
-	URL        string
-	StatusCode int
-	Body       []byte
+    URL        string
+    StatusCode int
+    Body       []byte
 }
-
+ 
 func scrape(ctx context.Context, urls []string, w typedpipe.Writer[Result]) {
-	var wg sync.WaitGroup
-	for _, url := range urls {
-		wg.Add(1)
-		go func(url string) {
-			defer wg.Done()
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-			if err != nil {
-				w.CloseWithError(fmt.Errorf("build request %s: %w", url, err))
-				return
-			}
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				w.CloseWithError(fmt.Errorf("fetch %s: %w", url, err))
-				return
-			}
-			defer resp.Body.Close()
-			body, _ := io.ReadAll(resp.Body)
-			w.Write(ctx, Result{
-				URL:        url,
-				StatusCode: resp.StatusCode,
-				Body:       body,
-			})
-		}(url)
-	}
-	wg.Wait()
-	w.Close()
+    defer w.Close()
+    var wg sync.WaitGroup
+    for _, url := range urls {
+        wg.Add(1)
+        go func(url string) {
+            defer wg.Done()
+            req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+            if err != nil {
+                w.CloseWithError(fmt.Errorf("build request %s: %w", url, err))
+                return
+            }
+            resp, err := http.DefaultClient.Do(req)
+            if err != nil {
+                w.CloseWithError(fmt.Errorf("fetch %s: %w", url, err))
+                return
+            }
+            defer resp.Body.Close()
+            body, _ := io.ReadAll(resp.Body)
+            w.Write(ctx, Result{
+                URL:        url,
+                StatusCode: resp.StatusCode,
+                Body:       body,
+            })
+        }(url)
+    }
+    wg.Wait()
 }
 ```
 
@@ -81,27 +81,27 @@ Use `ReadAll` for the straightforward consume-all case. The pipe is closed autom
 
 ```go
 func main() {
-	urls := []string{
-		"https://example.com",
-		"https://example.org",
-		"https://example.net",
-	}
-
-	ctx := context.Background()
-	w, r := typedpipe.New[Result](typedpipe.WithBufferSize(len(urls)))
-
-	go scrape(ctx, urls, w)
-
-	err := r.ReadAll(ctx, func(result Result) error {
-		if err := saveToDatabase(result); err != nil {
-			return fmt.Errorf("save %s: %w", result.URL, err)
-		}
-		log.Printf("saved %s (%d)", result.URL, result.StatusCode)
-		return nil
-	})
-	if err != nil {
-		log.Fatal("scraper stopped:", err)
-	}
+    urls := []string{
+        "https://example.com",
+        "https://example.org",
+        "https://example.net",
+    }
+    
+    ctx := context.Background()
+    w, r := typedpipe.New[Result](typedpipe.WithBufferSize(len(urls)))
+    
+    go scrape(ctx, urls, w)
+    
+    err := r.ReadAll(ctx, func(result Result) error {
+        if err := saveToDatabase(result); err != nil {
+            return fmt.Errorf("save %s: %w", result.URL, err)
+        }
+        log.Printf("saved %s (%d)", result.URL, result.StatusCode)
+        return nil
+    })
+    if err != nil {
+        log.Fatal("scraper stopped:", err)
+    }
 }
 ```
 
@@ -111,35 +111,38 @@ Use `Read` when you need finer control between reads — for example, routing re
 
 ```go
 func main() {
-	urls := []string{
-		"https://example.com",
-		"https://example.org",
-		"https://example.net",
-	}
-
-	ctx := context.Background()
-	w, r := typedpipe.New[Result](typedpipe.WithBufferSize(len(urls)))
-
-	go scrape(ctx, urls, w)
-
-	for {
-		result, err := r.Read(ctx)
-		if err != nil {
-			break
-		}
-		switch {
-		case result.StatusCode == http.StatusOK:
-			if err := saveToDatabase(result); err != nil {
-				r.CloseWithError(fmt.Errorf("save %s: %w", result.URL, err))
-			}
-			log.Printf("saved %s (%d)", result.URL, result.StatusCode)
-		case result.StatusCode >= 500:
-			log.Printf("server error %s (%d), retrying later", result.URL, result.StatusCode)
-			scheduleRetry(result.URL)
-		default:
-			log.Printf("skipping %s (%d)", result.URL, result.StatusCode)
-		}
-	}
+    urls := []string{
+        "https://example.com",
+        "https://example.org",
+        "https://example.net",
+    }
+    
+    ctx := context.Background()
+    w, r := typedpipe.New[Result](typedpipe.WithBufferSize(len(urls)))
+    
+    go scrape(ctx, urls, w)
+    
+    for {
+        result, err := r.Read(ctx)
+        if err != nil {
+            if !errors.Is(err, typedpipe.ErrPipeClosed) {
+                log.Fatal("reader stopped:", err)
+            }
+            break
+        }
+        switch {
+        case result.StatusCode == http.StatusOK:
+            if err := saveToDatabase(result); err != nil {
+                r.CloseWithError(fmt.Errorf("save %s: %w", result.URL, err))
+            }
+            log.Printf("saved %s (%d)", result.URL, result.StatusCode)
+        case result.StatusCode >= 500:
+            log.Printf("server error %s (%d), retrying later", result.URL, result.StatusCode)
+            scheduleRetry(result.URL)
+        default:
+            log.Printf("skipping %s (%d)", result.URL, result.StatusCode)
+        }
+    }
 }
 ```
 
@@ -156,6 +159,19 @@ func main() {
 * The pipe is closed
 
 Returns the stored close error if the pipe is closed, or `ctx.Err()` if the context is canceled.
+
+> **Important:** always close the pipe when the writer exits, regardless of the reason. If the writer's context is canceled and `Close` is not called, readers will block forever. The recommended pattern is:
+>
+> ```go
+> go func() {
+>     defer w.Close()
+>     for _, v := range data {
+>         if err := w.Write(ctx, v); err != nil {
+>             return
+>         }
+>     }
+> }()
+> ```
 
 ### Read
 
@@ -179,6 +195,8 @@ After all buffered values are consumed, returns the stored close error.
 
 Use `Read` when you need fine-grained control between reads (e.g. branching logic, integrating into a `select`). Use `ReadAll` for the straightforward consume-all case.
 
+> **Note:** if multiple goroutines call `ReadAll` concurrently, the first one to return will close the pipe, causing all others to stop early. For concurrent consumers, use `Read` instead.
+
 ### Close
 
 * `Close()` closes the pipe with `ErrPipeClosed`.
@@ -191,7 +209,7 @@ Use `Read` when you need fine-grained control between reads (e.g. branching logi
 ## Buffering
 ```go
 w, r := typedpipe.New[int](
-	typedpipe.WithBufferSize(128),
+    typedpipe.WithBufferSize(128),
 )
 ```
 
