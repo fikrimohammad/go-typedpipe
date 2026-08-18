@@ -3,10 +3,17 @@ package typedpipe
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+)
+
+// Verify interface implementations
+var (
+	_ io.Closer = Writer[int](nil)
+	_ io.Closer = Reader[int](nil)
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -24,19 +31,33 @@ func TestNew(t *testing.T) {
 	t.Run("default buffer size", func(t *testing.T) {
 		w, r := New[int]()
 		defer w.Close()
-		_ = r
+		if w.Cap() != DefaultBufferSize || r.Cap() != DefaultBufferSize {
+			t.Fatalf("Cap = %d, want %d", w.Cap(), DefaultBufferSize)
+		}
 	})
 
 	t.Run("large buffer size is allowed", func(t *testing.T) {
 		w, r := New[int](WithBufferSize(1 << 20)) // 1M — no cap enforced
 		defer w.Close()
-		_ = r
+		if w.Cap() != 1<<20 || r.Cap() != 1<<20 {
+			t.Fatalf("Cap = %d, want %d", w.Cap(), 1<<20)
+		}
 	})
 
 	t.Run("unbuffered pipe via zero size", func(t *testing.T) {
 		w, r := New[int](WithBufferSize(0))
 		defer w.Close()
-		_ = r
+		if w.Cap() != 0 || r.Cap() != 0 {
+			t.Fatalf("Cap = %d, want 0", w.Cap())
+		}
+	})
+
+	t.Run("unbuffered pipe via negative size", func(t *testing.T) {
+		w, r := New[int](WithBufferSize(-5))
+		defer w.Close()
+		if w.Cap() != 0 || r.Cap() != 0 {
+			t.Fatalf("Cap = %d, want 0", w.Cap())
+		}
 	})
 }
 
@@ -59,13 +80,56 @@ func TestFIFOOrdering(t *testing.T) {
 	w, r := newPipe[int](t, WithBufferSize(n))
 
 	for i := 0; i < n; i++ {
-		w.Write(bg(), i)
+		_ = w.Write(bg(), i)
 	}
 	for i := 0; i < n; i++ {
 		got, err := r.Read(bg())
 		if err != nil || got != i {
 			t.Fatalf("Read[%d] = (%d, %v), want (%d, nil)", i, got, err, i)
 		}
+	}
+}
+
+// ── introspection ─────────────────────────────────────────────────────────────
+
+func TestIntrospection(t *testing.T) {
+	w, r := newPipe[int](t, WithBufferSize(4))
+	if w.Len() != 0 || r.Len() != 0 {
+		t.Fatalf("Len = %d, want 0", w.Len())
+	}
+	if w.Cap() != 4 || r.Cap() != 4 {
+		t.Fatalf("Cap = %d, want 4", w.Cap())
+	}
+	if w.IsClosed() || r.IsClosed() {
+		t.Fatal("IsClosed = true before close, want false")
+	}
+
+	_ = w.Write(bg(), 10)
+	_ = w.Write(bg(), 20)
+	if w.Len() != 2 || r.Len() != 2 {
+		t.Fatalf("Len = %d, want 2", w.Len())
+	}
+
+	_ = w.Close()
+	if !w.IsClosed() || !r.IsClosed() {
+		t.Fatal("IsClosed = false after close, want true")
+	}
+
+	// Drain
+	val, err := r.Read(bg())
+	if err != nil || val != 10 {
+		t.Fatalf("Read = (%d, %v), want (10, nil)", val, err)
+	}
+	if r.Len() != 1 {
+		t.Fatalf("Len = %d, want 1", r.Len())
+	}
+
+	val, err = r.Read(bg())
+	if err != nil || val != 20 {
+		t.Fatalf("Read = (%d, %v), want (20, nil)", val, err)
+	}
+	if r.Len() != 0 {
+		t.Fatalf("Len = %d, want 0", r.Len())
 	}
 }
 
@@ -118,7 +182,7 @@ func TestContextCancellation(t *testing.T) {
 func TestClose(t *testing.T) {
 	t.Run("writer close surfaces ErrPipeClosed to reader", func(t *testing.T) {
 		w, r := newPipe[int](t)
-		w.Close()
+		_ = w.Close()
 		_, err := r.Read(bg())
 		if !errors.Is(err, ErrPipeClosed) {
 			t.Fatalf("got %v, want ErrPipeClosed", err)
@@ -127,7 +191,7 @@ func TestClose(t *testing.T) {
 
 	t.Run("reader close surfaces ErrPipeClosed to writer", func(t *testing.T) {
 		w, r := newPipe[int](t)
-		r.Close()
+		_ = r.Close()
 		err := w.Write(bg(), 1)
 		if !errors.Is(err, ErrPipeClosed) {
 			t.Fatalf("got %v, want ErrPipeClosed", err)
@@ -137,7 +201,7 @@ func TestClose(t *testing.T) {
 	t.Run("custom error is propagated", func(t *testing.T) {
 		sentinel := errors.New("sentinel")
 		w, r := newPipe[int](t)
-		w.CloseWithError(sentinel)
+		_ = w.CloseWithError(sentinel)
 		_, err := r.Read(bg())
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("got %v, want sentinel", err)
@@ -147,8 +211,8 @@ func TestClose(t *testing.T) {
 	t.Run("first error wins", func(t *testing.T) {
 		first, second := errors.New("first"), errors.New("second")
 		w, r := newPipe[int](t)
-		w.CloseWithError(first)
-		w.CloseWithError(second)
+		_ = w.CloseWithError(first)
+		_ = w.CloseWithError(second)
 		_, err := r.Read(bg())
 		if !errors.Is(err, first) {
 			t.Fatalf("got %v, want first", err)
@@ -158,8 +222,8 @@ func TestClose(t *testing.T) {
 	t.Run("idempotent — multiple closes do not panic", func(t *testing.T) {
 		w, r := newPipe[int](t)
 		for i := 0; i < 5; i++ {
-			w.Close()
-			r.Close()
+			_ = w.Close()
+			_ = r.Close()
 		}
 	})
 
@@ -169,7 +233,7 @@ func TestClose(t *testing.T) {
 		go func() { _, err := r.Read(bg()); errc <- err }()
 
 		time.Sleep(10 * time.Millisecond)
-		w.Close()
+		_ = w.Close()
 
 		select {
 		case err := <-errc:
@@ -187,7 +251,7 @@ func TestClose(t *testing.T) {
 		go func() { errc <- w.Write(bg(), 1) }()
 
 		time.Sleep(10 * time.Millisecond)
-		r.Close()
+		_ = r.Close()
 
 		select {
 		case err := <-errc:
@@ -209,9 +273,9 @@ func TestDrain(t *testing.T) {
 	w, r := newPipe[int](t, WithBufferSize(n))
 
 	for i := 0; i < n; i++ {
-		w.Write(bg(), i)
+		_ = w.Write(bg(), i)
 	}
-	w.Close()
+	_ = w.Close()
 
 	for i := 0; i < n; i++ {
 		got, err := r.Read(bg())
@@ -241,7 +305,7 @@ func TestRace_ConcurrentWriters(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for i := 0; i < each; i++ {
-				w.Write(bg(), id*1000+i)
+				_ = w.Write(bg(), id*1000+i)
 			}
 		}(g)
 	}
@@ -259,7 +323,7 @@ func TestRace_ConcurrentWriters(t *testing.T) {
 	}()
 
 	wg.Wait()
-	w.Close()
+	_ = w.Close()
 	<-done
 
 	if got := int(atomic.LoadInt64(&received)); got != goroutines*each {
@@ -274,9 +338,9 @@ func TestRace_ConcurrentReaders(t *testing.T) {
 	w, r := newPipe[int](t, WithBufferSize(total))
 
 	for i := 0; i < total; i++ {
-		w.Write(bg(), i)
+		_ = w.Write(bg(), i)
 	}
-	w.Close()
+	_ = w.Close()
 
 	var received int64
 	var wg sync.WaitGroup
@@ -330,7 +394,7 @@ func TestRace_CloseWhileReadingAndWriting(t *testing.T) {
 	}
 
 	time.Sleep(20 * time.Millisecond)
-	w.Close()
+	_ = w.Close()
 	wg.Wait()
 }
 
@@ -344,9 +408,9 @@ func TestRace_ConcurrentClose(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			if i%2 == 0 {
-				w.Close()
+				_ = w.Close()
 			} else {
-				r.Close()
+				_ = r.Close()
 			}
 		}(i)
 	}
@@ -360,8 +424,8 @@ func TestRace_ContextCancelAndClose(t *testing.T) {
 		w, r := newPipe[int](t, WithBufferSize(0))
 		ctx, cancel := context.WithCancel(bg())
 		go func() { cancel() }()
-		go func() { w.Close() }()
-		r.Read(ctx) //nolint:errcheck
+		go func() { _ = w.Close() }()
+		_, _ = r.Read(ctx)
 	}
 }
 
@@ -372,9 +436,9 @@ func TestReadAll(t *testing.T) {
 		const n = 64
 		w, r := newPipe[int](t, WithBufferSize(n))
 		for i := 0; i < n; i++ {
-			w.Write(bg(), i)
+			_ = w.Write(bg(), i)
 		}
-		w.Close()
+		_ = w.Close()
 
 		var got []int
 		err := r.ReadAll(bg(), func(v int) error {
@@ -404,10 +468,45 @@ func TestReadAll(t *testing.T) {
 		}
 	})
 
+	t.Run("propagates context cancellation to waiting writer", func(t *testing.T) {
+		w, r := newPipe[int](t, WithBufferSize(0))
+		ctx, cancel := context.WithCancel(bg())
+
+		writeErr := make(chan error, 1)
+		go func() {
+			// First write is consumed by ReadAll
+			if err := w.Write(bg(), 1); err != nil {
+				writeErr <- err
+				return
+			}
+			// Second write will block until ReadAll exits and closes pipe with context.Canceled
+			writeErr <- w.Write(bg(), 2)
+		}()
+
+		err := r.ReadAll(ctx, func(v int) error {
+			if v == 1 {
+				cancel()
+			}
+			return nil
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ReadAll got %v, want context.Canceled", err)
+		}
+
+		select {
+		case wErr := <-writeErr:
+			if !errors.Is(wErr, context.Canceled) {
+				t.Fatalf("writer got %v, want context.Canceled", wErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("writer did not unblock")
+		}
+	})
+
 	t.Run("returns custom close error", func(t *testing.T) {
 		sentinel := errors.New("sentinel")
 		w, r := newPipe[int](t)
-		w.CloseWithError(sentinel)
+		_ = w.CloseWithError(sentinel)
 		err := r.ReadAll(bg(), func(int) error { return nil })
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("got %v, want sentinel", err)
