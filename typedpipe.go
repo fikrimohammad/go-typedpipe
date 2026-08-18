@@ -52,6 +52,12 @@ const (
 //	}()
 type Writer[T any] interface {
 	Write(ctx context.Context, v T) error
+	// Len returns the number of buffered elements currently in the pipe.
+	Len() int
+	// Cap returns the total buffer capacity of the pipe.
+	Cap() int
+	// IsClosed reports whether the pipe has been closed.
+	IsClosed() bool
 	Closer
 }
 
@@ -68,15 +74,21 @@ type Reader[T any] interface {
 	// return will close the pipe, causing all others to stop early. For
 	// concurrent consumers, use Read instead.
 	ReadAll(ctx context.Context, fn func(T) error) error
+	// Len returns the number of buffered elements currently in the pipe.
+	Len() int
+	// Cap returns the total buffer capacity of the pipe.
+	Cap() int
+	// IsClosed reports whether the pipe has been closed.
+	IsClosed() bool
 	Closer
 }
 
-// Closer is the shared shutdown interface.
+// Closer is the shared shutdown interface, adhering to io.Closer.
 // The first non-nil error passed to CloseWithError is retained;
 // subsequent calls are no-ops.
 type Closer interface {
-	Close()
-	CloseWithError(err error)
+	Close() error
+	CloseWithError(err error) error
 }
 
 // New constructs a pipe and returns its Writer and Reader ends.
@@ -140,6 +152,14 @@ func (p *pipe[T]) write(ctx context.Context, v T) error {
 
 func (p *pipe[T]) read(ctx context.Context) (T, error) {
 	var zero T
+	// Non-blocking priority check: if context is canceled, return immediately
+	// before reading from ch.
+	select {
+	case <-ctx.Done():
+		return zero, ctx.Err()
+	default:
+	}
+
 	select {
 	case <-ctx.Done():
 		return zero, ctx.Err()
@@ -156,7 +176,7 @@ func (p *pipe[T]) read(ctx context.Context) (T, error) {
 	}
 }
 
-func (p *pipe[T]) close(err error) {
+func (p *pipe[T]) close(err error) error {
 	p.once.Do(func() {
 		if err == nil {
 			err = ErrPipeClosed
@@ -164,6 +184,24 @@ func (p *pipe[T]) close(err error) {
 		p.err.Store(err)
 		close(p.done)
 	})
+	return nil
+}
+
+func (p *pipe[T]) Len() int {
+	return len(p.ch)
+}
+
+func (p *pipe[T]) Cap() int {
+	return cap(p.ch)
+}
+
+func (p *pipe[T]) IsClosed() bool {
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // pipeError stores the first close error atomically.
@@ -189,27 +227,39 @@ func (pe *pipeError) Load() error {
 type writer[T any] struct{ p *pipe[T] }
 
 func (w *writer[T]) Write(ctx context.Context, v T) error { return w.p.write(ctx, v) }
-func (w *writer[T]) Close()                               { w.p.close(nil) }
-func (w *writer[T]) CloseWithError(err error)             { w.p.close(err) }
+func (w *writer[T]) Close() error                         { return w.p.close(nil) }
+func (w *writer[T]) CloseWithError(err error) error       { return w.p.close(err) }
+func (w *writer[T]) Len() int                             { return w.p.Len() }
+func (w *writer[T]) Cap() int                             { return w.p.Cap() }
+func (w *writer[T]) IsClosed() bool                       { return w.p.IsClosed() }
 
 type reader[T any] struct{ p *pipe[T] }
 
 func (r *reader[T]) Read(ctx context.Context) (T, error) { return r.p.read(ctx) }
-func (r *reader[T]) ReadAll(ctx context.Context, fn func(T) error) error {
-	defer r.Close()
+func (r *reader[T]) ReadAll(ctx context.Context, fn func(T) error) (err error) {
+	defer func() {
+		if err != nil && !errors.Is(err, ErrPipeClosed) {
+			_ = r.CloseWithError(err)
+		} else {
+			_ = r.Close()
+		}
+	}()
 	for {
-		v, err := r.Read(ctx)
+		var v T
+		v, err = r.Read(ctx)
 		if err != nil {
 			if errors.Is(err, ErrPipeClosed) {
 				return nil
 			}
 			return err
 		}
-		if err := fn(v); err != nil {
-			r.CloseWithError(err)
+		if err = fn(v); err != nil {
 			return err
 		}
 	}
 }
-func (r *reader[T]) Close()                   { r.p.close(nil) }
-func (r *reader[T]) CloseWithError(err error) { r.p.close(err) }
+func (r *reader[T]) Close() error                   { return r.p.close(nil) }
+func (r *reader[T]) CloseWithError(err error) error { return r.p.close(err) }
+func (r *reader[T]) Len() int                       { return r.p.Len() }
+func (r *reader[T]) Cap() int                       { return r.p.Cap() }
+func (r *reader[T]) IsClosed() bool                 { return r.p.IsClosed() }
